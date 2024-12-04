@@ -20,6 +20,9 @@ this is a switch bot event to notify discord.
 # reference
 
 [Zenn 7oh](https://zenn.dev/7oh/scraps/c540b175727f28)様
+
 [Qiita narikakun](https://qiita.com/narikakun/items/4868c0bef27)様
+
 [Zenn Tanny](https://zenn.dev/tanny/articles/e03e28d1bbd37b)様
+
 [yamamanx](https://www.yamamanx.com/lambda-function-update-environment/)様
