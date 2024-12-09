@@ -30,3 +30,5 @@ this is a switch bot event to notify discord.
 # Use this program manual
 
 Please check this [blog site page](https://kohaku-kageroh.hatenablog.com/entry/20241209/1733746235).
+
+but, all Japanse only excuse.
