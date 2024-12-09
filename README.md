@@ -26,3 +26,7 @@ this is a switch bot event to notify discord.
 [Zenn Tanny](https://zenn.dev/tanny/articles/e03e28d1bbd37b)様
 
 [yamamanx](https://www.yamamanx.com/lambda-function-update-environment/)様
+
+# Use this program manual
+
+Please check this [blog site page](https://kohaku-kageroh.hatenablog.com/entry/20241209/1733746235).
