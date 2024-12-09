@@ -11,11 +11,11 @@ this is a switch bot event to notify discord.
 
 # definition
 
-- Switchbot API をゲットしてWebHookにする
-  - AWS Lambdaで実行する。
-- 以下をWebHookでdiscordへ通知する
-  - 定時刻でLambdaを起動してSwitchbotで計測してる室温/湿度を通知する
-  - 鍵の状態が変更される事に通知する
+- Switchbot API get to WebHook
+  - AWS Lambda launch
+- Send to WebHook discord notify
+  - schedule launch on Lambda is Switchbot temperature and humidity notify.
+  - Lock status change by notify.
 
 # reference
 
