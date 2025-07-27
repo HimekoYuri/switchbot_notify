@@ -7,11 +7,46 @@ import uuid
 import time
 import requests
 import logging
+import re
 from urllib.parse import urlparse
 
 # ログ設定（機密情報を含まないよう設定）
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+def sanitize_log_input(input_data):
+    """ログインジェクション対策のためのサニタイゼーション"""
+    if input_data is None:
+        return "None"
+    
+    # 文字列に変換
+    sanitized = str(input_data)
+    
+    # 改行文字を削除/置換（ログインジェクション対策）
+    sanitized = sanitized.replace('\n', '\\n')
+    sanitized = sanitized.replace('\r', '\\r')
+    sanitized = sanitized.replace('\t', '\\t')
+    
+    # 制御文字を削除
+    sanitized = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', sanitized)
+    
+    # 長すぎる文字列は切り詰め
+    if len(sanitized) > 1000:
+        sanitized = sanitized[:1000] + "...[truncated]"
+    
+    return sanitized
+
+def safe_log_info(message, *args):
+    """安全なログ出力（INFO）"""
+    sanitized_message = sanitize_log_input(message)
+    sanitized_args = [sanitize_log_input(arg) for arg in args]
+    logger.info(sanitized_message, *sanitized_args)
+
+def safe_log_error(message, *args):
+    """安全なログ出力（ERROR）"""
+    sanitized_message = sanitize_log_input(message)
+    sanitized_args = [sanitize_log_input(arg) for arg in args]
+    logger.error(sanitized_message, *sanitized_args)
 
 def validate_environment_variables():
     """環境変数の検証"""
@@ -80,7 +115,7 @@ def create_switchbot_headers(token, secret):
             "nonce": nonce
         }
     except Exception as e:
-        logger.error(f"ヘッダー作成エラー: {str(e)}")
+        safe_log_error(f"ヘッダー作成エラー: {str(e)}")
         raise
 
 def get_switchbot_data(device_id, token, secret, switchbot_url):
@@ -90,7 +125,7 @@ def get_switchbot_data(device_id, token, secret, switchbot_url):
         url = f"{switchbot_url}{device_id}/status"
         
         # リクエスト情報をログ出力（機密情報は除外）
-        logger.info(f"SwitchBot APIリクエスト: {url}")
+        safe_log_info(f"SwitchBot APIリクエスト: {url}")
         
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
@@ -103,21 +138,21 @@ def get_switchbot_data(device_id, token, secret, switchbot_url):
         
         # 機密情報をマスクしてログ出力
         masked_data = mask_sensitive_data(data, ['token', 'secret', 'authorization'])
-        logger.info(f"SwitchBotデータ取得成功: {json.dumps(masked_data, ensure_ascii=False)}")
+        safe_log_info(f"SwitchBotデータ取得成功: {json.dumps(masked_data, ensure_ascii=False)}")
         
         return data['body']
         
     except requests.exceptions.Timeout:
-        logger.error("SwitchBot API タイムアウト")
+        safe_log_error("SwitchBot API タイムアウト")
         raise
     except requests.exceptions.RequestException as e:
-        logger.error(f"SwitchBot API リクエストエラー: {str(e)}")
+        safe_log_error(f"SwitchBot API リクエストエラー: {str(e)}")
         raise
     except json.JSONDecodeError as e:
-        logger.error(f"SwitchBot API レスポンス解析エラー: {str(e)}")
+        safe_log_error(f"SwitchBot API レスポンス解析エラー: {str(e)}")
         raise
     except Exception as e:
-        logger.error(f"SwitchBotデータ取得エラー: {str(e)}")
+        safe_log_error(f"SwitchBotデータ取得エラー: {str(e)}")
         raise
 
 def send_discord_notification(devices_data, discord_url, user_id):
@@ -150,27 +185,27 @@ def send_discord_notification(devices_data, discord_url, user_id):
         
         # 機密情報をマスクしてログ出力
         masked_payload = mask_sensitive_data(payload, ['user_id'])
-        logger.info(f"Discord通知送信: {json.dumps(masked_payload, ensure_ascii=False)}")
+        safe_log_info(f"Discord通知送信: {json.dumps(masked_payload, ensure_ascii=False)}")
         
         response = requests.post(discord_url, json=payload, headers=headers, timeout=30)
         response.raise_for_status()
         
-        logger.info("Discord通知送信成功")
+        safe_log_info("Discord通知送信成功")
         
     except requests.exceptions.Timeout:
-        logger.error("Discord通知 タイムアウト")
+        safe_log_error("Discord通知 タイムアウト")
         raise
     except requests.exceptions.RequestException as e:
-        logger.error(f"Discord通知 リクエストエラー: {str(e)}")
+        safe_log_error(f"Discord通知 リクエストエラー: {str(e)}")
         raise
     except Exception as e:
-        logger.error(f"Discord通知送信エラー: {str(e)}")
+        safe_log_error(f"Discord通知送信エラー: {str(e)}")
         raise
 
 def lambda_handler(event, context):
     """Lambda関数のメインハンドラー"""
     try:
-        logger.info("温度・湿度通知処理開始")
+        safe_log_info("温度・湿度通知処理開始")
         
         # 環境変数の検証
         validate_environment_variables()
@@ -189,7 +224,7 @@ def lambda_handler(event, context):
         # Discord通知送信
         send_discord_notification(devices_data, discord_url, user_id)
         
-        logger.info("温度・湿度通知処理完了")
+        safe_log_info("温度・湿度通知処理完了")
         
         return {
             'statusCode': 200,
@@ -200,7 +235,7 @@ def lambda_handler(event, context):
         }
         
     except Exception as e:
-        logger.error(f"処理エラー: {str(e)}")
+        safe_log_error(f"処理エラー: {str(e)}")
         return {
             'statusCode': 500,
             'body': json.dumps({

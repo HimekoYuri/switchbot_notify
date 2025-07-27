@@ -3,12 +3,47 @@ import requests
 import os
 import boto3
 import logging
+import re
 from urllib.parse import urlparse
 from botocore.exceptions import ClientError, BotoCoreError
 
 # ログ設定（機密情報を含まないよう設定）
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+def sanitize_log_input(input_data):
+    """ログインジェクション対策のためのサニタイゼーション"""
+    if input_data is None:
+        return "None"
+    
+    # 文字列に変換
+    sanitized = str(input_data)
+    
+    # 改行文字を削除/置換（ログインジェクション対策）
+    sanitized = sanitized.replace('\n', '\\n')
+    sanitized = sanitized.replace('\r', '\\r')
+    sanitized = sanitized.replace('\t', '\\t')
+    
+    # 制御文字を削除
+    sanitized = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', sanitized)
+    
+    # 長すぎる文字列は切り詰め
+    if len(sanitized) > 1000:
+        sanitized = sanitized[:1000] + "...[truncated]"
+    
+    return sanitized
+
+def safe_log_info(message, *args):
+    """安全なログ出力（INFO）"""
+    sanitized_message = sanitize_log_input(message)
+    sanitized_args = [sanitize_log_input(arg) for arg in args]
+    logger.info(sanitized_message, *sanitized_args)
+
+def safe_log_error(message, *args):
+    """安全なログ出力（ERROR）"""
+    sanitized_message = sanitize_log_input(message)
+    sanitized_args = [sanitize_log_input(arg) for arg in args]
+    logger.error(sanitized_message, *sanitized_args)
 
 def validate_environment_variables():
     """環境変数の検証"""
@@ -91,7 +126,7 @@ def check_lambda_permissions(lambda_client, function_arn):
         if 'Role' not in response:
             raise ValueError("Lambda関数の実行ロールが設定されていません")
         
-        logger.info("Lambda関数の権限チェック完了")
+        safe_log_info("Lambda関数の権限チェック完了")
         return True
         
     except ClientError as e:
@@ -116,22 +151,22 @@ def send_discord_notification(discord_url, user_id, key_type, lock_state, batter
             "content": f"<@{user_id}> {key_type}の状態：{lock_state}, 電池残量：{battery}"
         }
         
-        logger.info(f"Discord通知送信: {key_type}の状態変更")
+        safe_log_info(f"Discord通知送信: {key_type}の状態変更")
         
         response = requests.post(discord_url, json=payload, headers=headers, timeout=30)
         response.raise_for_status()
         
-        logger.info("Discord通知送信成功")
+        safe_log_info("Discord通知送信成功")
         return True
         
     except requests.exceptions.Timeout:
-        logger.error("Discord通知 タイムアウト")
+        safe_log_error("Discord通知 タイムアウト")
         raise
     except requests.exceptions.RequestException as e:
-        logger.error(f"Discord通知 リクエストエラー: {str(e)}")
+        safe_log_error(f"Discord通知 リクエストエラー: {str(e)}")
         raise
     except Exception as e:
-        logger.error(f"Discord通知送信エラー: {str(e)}")
+        safe_log_error(f"Discord通知送信エラー: {str(e)}")
         raise
 
 def update_function_environment(lambda_client, function_arn, new_key_state, discord_url, user_id):
@@ -160,7 +195,7 @@ def update_function_environment(lambda_client, function_arn, new_key_state, disc
             }
         )
         
-        logger.info("Lambda関数環境変数更新成功")
+        safe_log_info("Lambda関数環境変数更新成功")
         return response
         
     except ClientError as e:
@@ -179,7 +214,7 @@ def update_function_environment(lambda_client, function_arn, new_key_state, disc
 def lambda_handler(event, context):
     """Lambda関数のメインハンドラー（セキュリティ強化版）"""
     try:
-        logger.info("下の鍵ロック状態通知処理開始")
+        safe_log_info("下の鍵ロック状態通知処理開始")
         
         # 環境変数の検証
         validate_environment_variables()
@@ -199,7 +234,7 @@ def lambda_handler(event, context):
         try:
             lambda_client = boto3.client('lambda')
         except Exception as e:
-            logger.error(f"Lambda クライアント作成エラー: {str(e)}")
+            safe_log_error(f"Lambda クライアント作成エラー: {str(e)}")
             raise ValueError("AWS Lambda サービスへの接続に失敗しました")
         
         # Lambda関数の権限チェック
@@ -212,7 +247,7 @@ def lambda_handler(event, context):
         
         # 状態変更チェック
         if current_key_state == lock_state:
-            logger.info(f"状態が同じなので処理終了: {lock_state}")
+            safe_log_info(f"状態が同じなので処理終了: {lock_state}")
             return {
                 'statusCode': 204,
                 'body': json.dumps({
@@ -227,7 +262,7 @@ def lambda_handler(event, context):
         # 環境変数更新
         update_function_environment(lambda_client, function_arn, lock_state, discord_url, user_id)
         
-        logger.info("下の鍵ロック状態通知処理完了")
+        safe_log_info("下の鍵ロック状態通知処理完了")
         
         return {
             'statusCode': 200,
@@ -239,7 +274,7 @@ def lambda_handler(event, context):
         }
         
     except ValueError as e:
-        logger.error(f"バリデーションエラー: {str(e)}")
+        safe_log_error(f"バリデーションエラー: {str(e)}")
         return {
             'statusCode': 400,
             'body': json.dumps({
@@ -247,7 +282,7 @@ def lambda_handler(event, context):
             }, ensure_ascii=False)
         }
     except Exception as e:
-        logger.error(f"処理エラー: {str(e)}")
+        safe_log_error(f"処理エラー: {str(e)}")
         return {
             'statusCode': 500,
             'body': json.dumps({
