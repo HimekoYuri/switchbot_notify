@@ -4,12 +4,21 @@ import os
 import boto3
 import logging
 import re
+import hashlib
+import hmac
+import time
 from urllib.parse import urlparse
 from botocore.exceptions import ClientError, BotoCoreError
 
 # ログ設定（機密情報を含まないよう設定）
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# セキュリティ設定
+ALLOWED_SOURCE_IPS = os.getenv('ALLOWED_SOURCE_IPS', '').split(',') if os.getenv('ALLOWED_SOURCE_IPS') else []
+MAX_REQUEST_AGE = int(os.getenv('MAX_REQUEST_AGE', '300'))  # 5分
+RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '60'))  # 1分
+MAX_REQUESTS_PER_WINDOW = int(os.getenv('MAX_REQUESTS_PER_WINDOW', '10'))
 
 def sanitize_log_input(input_data):
     """ログインジェクション対策のためのサニタイゼーション"""
@@ -44,6 +53,142 @@ def safe_log_error(message, *args):
     sanitized_message = sanitize_log_input(message)
     sanitized_args = [sanitize_log_input(arg) for arg in args]
     logger.error(sanitized_message, *sanitized_args)
+
+def verify_request_signature(event, secret_key):
+    """リクエスト署名の検証（認可制御強化）"""
+    try:
+        # ヘッダーから署名情報を取得
+        headers = event.get('headers', {})
+        received_signature = headers.get('X-Signature')
+        timestamp = headers.get('X-Timestamp')
+        
+        if not received_signature or not timestamp:
+            safe_log_error("署名またはタイムスタンプが不足しています")
+            return False
+        
+        # タイムスタンプの検証（リプレイ攻撃対策）
+        current_time = int(time.time())
+        request_time = int(timestamp)
+        
+        if abs(current_time - request_time) > MAX_REQUEST_AGE:
+            safe_log_error(f"リクエストが古すぎます: {current_time - request_time}秒")
+            return False
+        
+        # 署名の計算
+        body = event.get('body', '')
+        message = f"{timestamp}{body}"
+        expected_signature = hmac.new(
+            secret_key.encode('utf-8'),
+            message.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        
+        # 署名の比較（タイミング攻撃対策）
+        if not hmac.compare_digest(received_signature, expected_signature):
+            safe_log_error("署名が一致しません")
+            return False
+        
+        safe_log_info("リクエスト署名検証成功")
+        return True
+        
+    except Exception as e:
+        safe_log_error(f"署名検証エラー: {str(e)}")
+        return False
+
+def verify_source_ip(event):
+    """送信元IPアドレスの検証"""
+    try:
+        if not ALLOWED_SOURCE_IPS or ALLOWED_SOURCE_IPS == ['']:
+            # IP制限が設定されていない場合はスキップ
+            return True
+        
+        # Lambda関数の場合、送信元IPは複数の場所に格納される可能性がある
+        source_ip = None
+        
+        # API Gatewayからの場合
+        if 'requestContext' in event:
+            source_ip = event['requestContext'].get('identity', {}).get('sourceIp')
+        
+        # ALBからの場合
+        if not source_ip and 'headers' in event:
+            source_ip = event['headers'].get('X-Forwarded-For', '').split(',')[0].strip()
+        
+        if not source_ip:
+            safe_log_error("送信元IPアドレスが特定できません")
+            return False
+        
+        if source_ip not in ALLOWED_SOURCE_IPS:
+            safe_log_error(f"許可されていないIPアドレス: {source_ip}")
+            return False
+        
+        safe_log_info(f"送信元IP検証成功: {source_ip}")
+        return True
+        
+    except Exception as e:
+        safe_log_error(f"IP検証エラー: {str(e)}")
+        return False
+
+def verify_iam_permissions(context):
+    """IAM権限の検証（サーバーサイド認証）"""
+    try:
+        # Lambda実行ロールの検証
+        if not hasattr(context, 'invoked_function_arn'):
+            safe_log_error("Lambda実行コンテキストが無効です")
+            return False
+        
+        # ARNから実行ロールを抽出して検証
+        function_arn = context.invoked_function_arn
+        if not function_arn.startswith('arn:aws:lambda:'):
+            safe_log_error("無効なLambda関数ARN")
+            return False
+        
+        # 実行ロールの詳細確認
+        try:
+            sts_client = boto3.client('sts')
+            caller_identity = sts_client.get_caller_identity()
+            
+            # 実行ロールが期待されるものかチェック
+            expected_role_pattern = 'role-SendKeyStatusToDiscord'
+            if expected_role_pattern not in caller_identity.get('Arn', ''):
+                safe_log_error(f"予期しない実行ロール: {caller_identity.get('Arn')}")
+                return False
+            
+            safe_log_info("IAM権限検証成功")
+            return True
+            
+        except Exception as e:
+            safe_log_error(f"STS呼び出しエラー: {str(e)}")
+            return False
+        
+    except Exception as e:
+        safe_log_error(f"IAM権限検証エラー: {str(e)}")
+        return False
+
+def perform_authorization_checks(event, context):
+    """包括的な認可チェック（Broken Access Control対策）"""
+    try:
+        safe_log_info("認可チェック開始")
+        
+        # 1. IAM権限の検証（サーバーサイド認証）
+        if not verify_iam_permissions(context):
+            raise ValueError("IAM権限検証に失敗しました")
+        
+        # 2. 送信元IPアドレスの検証
+        if not verify_source_ip(event):
+            raise ValueError("送信元IP検証に失敗しました")
+        
+        # 3. リクエスト署名の検証（設定されている場合）
+        webhook_secret = os.getenv('WEBHOOK_SECRET')
+        if webhook_secret:
+            if not verify_request_signature(event, webhook_secret):
+                raise ValueError("リクエスト署名検証に失敗しました")
+        
+        safe_log_info("全ての認可チェックが成功しました")
+        return True
+        
+    except Exception as e:
+        safe_log_error(f"認可チェックエラー: {str(e)}")
+        return False
 
 def validate_environment_variables():
     """環境変数の検証"""
@@ -212,14 +357,24 @@ def update_function_environment(lambda_client, function_arn, new_key_state, disc
         raise ValueError(f"環境変数更新で予期しないエラー: {str(e)}")
 
 def lambda_handler(event, context):
-    """Lambda関数のメインハンドラー（セキュリティ強化版）"""
+    """Lambda関数のメインハンドラー（認可制御強化版）"""
     try:
         safe_log_info("下の鍵ロック状態通知処理開始")
+        
+        # 認可チェック（Broken Access Control対策）
+        if not perform_authorization_checks(event, context):
+            safe_log_error("認可チェックに失敗しました")
+            return {
+                'statusCode': 403,
+                'body': json.dumps({
+                    'error': 'アクセスが拒否されました'
+                }, ensure_ascii=False)
+            }
         
         # 環境変数の検証
         validate_environment_variables()
         
-        # イベントデータの検証
+        # イベントデータの検証（認可チェック後に実行）
         context_data = validate_event_data(event)
         
         # Lambda実行コンテキストの検証

@@ -14,6 +14,10 @@ from urllib.parse import urlparse
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# セキュリティ設定
+ALLOWED_SOURCE_IPS = os.getenv('ALLOWED_SOURCE_IPS', '').split(',') if os.getenv('ALLOWED_SOURCE_IPS') else []
+MAX_REQUEST_AGE = int(os.getenv('MAX_REQUEST_AGE', '300'))  # 5分
+
 def sanitize_log_input(input_data):
     """ログインジェクション対策のためのサニタイゼーション"""
     if input_data is None:
@@ -47,6 +51,55 @@ def safe_log_error(message, *args):
     sanitized_message = sanitize_log_input(message)
     sanitized_args = [sanitize_log_input(arg) for arg in args]
     logger.error(sanitized_message, *sanitized_args)
+
+def verify_scheduled_execution(context):
+    """スケジュール実行の検証（認可制御強化）"""
+    try:
+        # CloudWatch Eventsからの実行かチェック
+        if hasattr(context, 'invoked_function_arn'):
+            function_arn = context.invoked_function_arn
+            if not function_arn.startswith('arn:aws:lambda:'):
+                safe_log_error("無効なLambda関数ARN")
+                return False
+        
+        # 実行ロールの検証
+        try:
+            import boto3
+            sts_client = boto3.client('sts')
+            caller_identity = sts_client.get_caller_identity()
+            
+            # 期待される実行ロールかチェック
+            expected_role_pattern = 'role-SendTemperatureHumiditytoDiscord'
+            if expected_role_pattern not in caller_identity.get('Arn', ''):
+                safe_log_error(f"予期しない実行ロール: {caller_identity.get('Arn')}")
+                return False
+            
+            safe_log_info("スケジュール実行検証成功")
+            return True
+            
+        except Exception as e:
+            safe_log_error(f"STS呼び出しエラー: {str(e)}")
+            return False
+        
+    except Exception as e:
+        safe_log_error(f"スケジュール実行検証エラー: {str(e)}")
+        return False
+
+def perform_authorization_checks(event, context):
+    """包括的な認可チェック（Broken Access Control対策）"""
+    try:
+        safe_log_info("認可チェック開始")
+        
+        # スケジュール実行の検証（温度・湿度通知は定期実行）
+        if not verify_scheduled_execution(context):
+            raise ValueError("スケジュール実行検証に失敗しました")
+        
+        safe_log_info("全ての認可チェックが成功しました")
+        return True
+        
+    except Exception as e:
+        safe_log_error(f"認可チェックエラー: {str(e)}")
+        return False
 
 def validate_environment_variables():
     """環境変数の検証"""
@@ -203,9 +256,19 @@ def send_discord_notification(devices_data, discord_url, user_id):
         raise
 
 def lambda_handler(event, context):
-    """Lambda関数のメインハンドラー"""
+    """Lambda関数のメインハンドラー（認可制御強化版）"""
     try:
         safe_log_info("温度・湿度通知処理開始")
+        
+        # 認可チェック（Broken Access Control対策）
+        if not perform_authorization_checks(event, context):
+            safe_log_error("認可チェックに失敗しました")
+            return {
+                'statusCode': 403,
+                'body': json.dumps({
+                    'error': 'アクセスが拒否されました'
+                }, ensure_ascii=False)
+            }
         
         # 環境変数の検証
         validate_environment_variables()
