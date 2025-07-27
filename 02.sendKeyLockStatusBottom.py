@@ -2,54 +2,255 @@ import json
 import requests
 import os
 import boto3
+import logging
+from urllib.parse import urlparse
+from botocore.exceptions import ClientError, BotoCoreError
+
+# ログ設定（機密情報を含まないよう設定）
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def validate_environment_variables():
+    """環境変数の検証"""
+    required_vars = ['URL', 'USER_ID']
+    missing_vars = []
+    
+    for var in required_vars:
+        value = os.getenv(var)
+        if not value or value.strip() == '':
+            missing_vars.append(var)
+    
+    if missing_vars:
+        raise ValueError(f"必要な環境変数が設定されていません: {', '.join(missing_vars)}")
+    
+    # Discord URL形式の検証
+    discord_url = os.getenv('URL')
+    if not is_valid_discord_webhook_url(discord_url):
+        raise ValueError("Discord Webhook URLが無効です")
+
+def is_valid_discord_webhook_url(url):
+    """Discord Webhook URLの検証"""
+    try:
+        parsed = urlparse(url)
+        return (parsed.scheme == 'https' and 
+                'discord.com' in parsed.netloc and 
+                '/api/webhooks/' in parsed.path)
+    except:
+        return False
+
+def validate_event_data(event):
+    """イベントデータの検証"""
+    if not isinstance(event, dict):
+        raise ValueError("イベントデータが無効です")
+    
+    if "context" not in event:
+        raise ValueError("イベントデータに'context'が含まれていません")
+    
+    context_data = event["context"]
+    if not isinstance(context_data, dict):
+        raise ValueError("contextデータが無効です")
+    
+    required_fields = ["battery", "lockState"]
+    for field in required_fields:
+        if field not in context_data:
+            raise ValueError(f"contextデータに'{field}'が含まれていません")
+    
+    # データ型の検証
+    battery = context_data["battery"]
+    lock_state = context_data["lockState"]
+    
+    if not isinstance(battery, (int, float)) or battery < 0 or battery > 100:
+        raise ValueError("電池残量データが無効です（0-100の範囲で指定してください）")
+    
+    if not isinstance(lock_state, str) or lock_state.strip() == '':
+        raise ValueError("鍵状態データが無効です")
+    
+    return context_data
+
+def validate_lambda_context(context):
+    """Lambda実行コンテキストの検証"""
+    if not hasattr(context, 'invoked_function_arn'):
+        raise ValueError("Lambda実行コンテキストが無効です")
+    
+    # ARNの基本的な形式チェック
+    arn = context.invoked_function_arn
+    if not arn or not arn.startswith('arn:aws:lambda:'):
+        raise ValueError("Lambda関数ARNが無効です")
+    
+    return arn
+
+def check_lambda_permissions(lambda_client, function_arn):
+    """Lambda関数の権限チェック"""
+    try:
+        # 関数の存在確認と基本情報取得
+        response = lambda_client.get_function_configuration(
+            FunctionName=function_arn
+        )
+        
+        # 実行ロールの確認
+        if 'Role' not in response:
+            raise ValueError("Lambda関数の実行ロールが設定されていません")
+        
+        logger.info("Lambda関数の権限チェック完了")
+        return True
+        
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        if error_code == 'ResourceNotFoundException':
+            raise ValueError("指定されたLambda関数が見つかりません")
+        elif error_code == 'AccessDeniedException':
+            raise ValueError("Lambda関数へのアクセス権限がありません")
+        else:
+            raise ValueError(f"Lambda関数の権限チェックエラー: {error_code}")
+    except Exception as e:
+        raise ValueError(f"Lambda関数の権限チェックで予期しないエラー: {str(e)}")
+
+def send_discord_notification(discord_url, user_id, key_type, lock_state, battery):
+    """Discord通知送信（セキュリティ強化版）"""
+    try:
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "content": f"<@{user_id}> {key_type}の状態：{lock_state}, 電池残量：{battery}"
+        }
+        
+        logger.info(f"Discord通知送信: {key_type}の状態変更")
+        
+        response = requests.post(discord_url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        logger.info("Discord通知送信成功")
+        return True
+        
+    except requests.exceptions.Timeout:
+        logger.error("Discord通知 タイムアウト")
+        raise
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Discord通知 リクエストエラー: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"Discord通知送信エラー: {str(e)}")
+        raise
+
+def update_function_environment(lambda_client, function_arn, new_key_state, discord_url, user_id):
+    """Lambda関数環境変数の安全な更新"""
+    try:
+        # 現在の環境変数を取得
+        current_config = lambda_client.get_function_configuration(
+            FunctionName=function_arn
+        )
+        
+        current_env = current_config.get('Environment', {}).get('Variables', {})
+        
+        # 新しい環境変数を設定（既存の値を保持）
+        new_env = current_env.copy()
+        new_env.update({
+            'URL': discord_url,
+            'USER_ID': user_id,
+            'KEY_STATE': new_key_state
+        })
+        
+        # 環境変数を更新
+        response = lambda_client.update_function_configuration(
+            FunctionName=function_arn,
+            Environment={
+                'Variables': new_env
+            }
+        )
+        
+        logger.info("Lambda関数環境変数更新成功")
+        return response
+        
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        if error_code == 'ResourceNotFoundException':
+            raise ValueError("指定されたLambda関数が見つかりません")
+        elif error_code == 'AccessDeniedException':
+            raise ValueError("Lambda関数の環境変数更新権限がありません")
+        elif error_code == 'InvalidParameterValueException':
+            raise ValueError("環境変数の値が無効です")
+        else:
+            raise ValueError(f"環境変数更新エラー: {error_code}")
+    except Exception as e:
+        raise ValueError(f"環境変数更新で予期しないエラー: {str(e)}")
 
 def lambda_handler(event, context):
-    url = os.getenv('URL')
-    userId = os.getenv('USER_ID')
-    body = event["context"]    
-    keyState = os.getenv('KEY_STATE')
-
-    lambda_client = boto3.client('lambda')
-    keyType = "下の鍵"
-    
-    # 電池残量と鍵の状態を取得。
-    battery = body["battery"]
-    lockState = body["lockState"]
-   
-    if keyState == lockState:
-        print(f"状態が同じなので処理終了({lockState})")
-        return {
-            'status': 204
-        }
-
-    # Header
-    headers ={
-        "Content-Type": "application/json"
-    }
-
-    # 送信内容
-    payload = {
-        "content": f"<@{userId}> {keyType}の状態：{lockState}, 電池残量：{battery}"
-    }
-    print(payload)
-    # POSTリクエストを送信
-    response = requests.post(url, json=payload, headers=headers)
-
-    print(response)
-
-    lambdaResponse = lambda_client.update_function_configuration(
-        FunctionName=context.invoked_function_arn,
-        Environment={
-            'Variables': {
-                'URL': url,
-                'USER_ID': userId,
-                'KEY_STATE': lockState
+    """Lambda関数のメインハンドラー（セキュリティ強化版）"""
+    try:
+        logger.info("下の鍵ロック状態通知処理開始")
+        
+        # 環境変数の検証
+        validate_environment_variables()
+        
+        # イベントデータの検証
+        context_data = validate_event_data(event)
+        
+        # Lambda実行コンテキストの検証
+        function_arn = validate_lambda_context(context)
+        
+        # 環境変数取得
+        discord_url = os.getenv('URL')
+        user_id = os.getenv('USER_ID')
+        current_key_state = os.getenv('KEY_STATE', '')  # デフォルト値を設定
+        
+        # Lambda クライアント作成
+        try:
+            lambda_client = boto3.client('lambda')
+        except Exception as e:
+            logger.error(f"Lambda クライアント作成エラー: {str(e)}")
+            raise ValueError("AWS Lambda サービスへの接続に失敗しました")
+        
+        # Lambda関数の権限チェック
+        check_lambda_permissions(lambda_client, function_arn)
+        
+        # データ取得
+        battery = context_data["battery"]
+        lock_state = context_data["lockState"]
+        key_type = "下の鍵"
+        
+        # 状態変更チェック
+        if current_key_state == lock_state:
+            logger.info(f"状態が同じなので処理終了: {lock_state}")
+            return {
+                'statusCode': 204,
+                'body': json.dumps({
+                    'message': '状態変更なし',
+                    'current_state': lock_state
+                }, ensure_ascii=False)
             }
+        
+        # Discord通知送信
+        send_discord_notification(discord_url, user_id, key_type, lock_state, battery)
+        
+        # 環境変数更新
+        update_function_environment(lambda_client, function_arn, lock_state, discord_url, user_id)
+        
+        logger.info("下の鍵ロック状態通知処理完了")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': '下の鍵状態通知送信完了',
+                'new_state': lock_state,
+                'battery': battery
+            }, ensure_ascii=False)
         }
-    )
-
-    print(lambdaResponse)
-
-    return {
-        'statusCode': 200,
-    }
+        
+    except ValueError as e:
+        logger.error(f"バリデーションエラー: {str(e)}")
+        return {
+            'statusCode': 400,
+            'body': json.dumps({
+                'error': 'リクエストデータが無効です'
+            }, ensure_ascii=False)
+        }
+    except Exception as e:
+        logger.error(f"処理エラー: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': '内部サーバーエラー'
+            }, ensure_ascii=False)
+        }
