@@ -8,7 +8,9 @@ import time
 import requests
 import logging
 import re
+import boto3
 from urllib.parse import urlparse
+from botocore.exceptions import ClientError
 
 # ログ設定（機密情報を含まないよう設定）
 logger = logging.getLogger()
@@ -17,6 +19,14 @@ logger.setLevel(logging.INFO)
 # セキュリティ設定
 ALLOWED_SOURCE_IPS = os.getenv('ALLOWED_SOURCE_IPS', '').split(',') if os.getenv('ALLOWED_SOURCE_IPS') else []
 MAX_REQUEST_AGE = int(os.getenv('MAX_REQUEST_AGE', '300'))  # 5分
+
+# 認可レベル定義
+AUTHORIZATION_LEVELS = {
+    'ADMIN': 100,
+    'OPERATOR': 50,
+    'VIEWER': 10,
+    'GUEST': 0
+}
 
 def sanitize_log_input(input_data):
     """ログインジェクション対策のためのサニタイゼーション"""
@@ -52,49 +62,181 @@ def safe_log_error(message, *args):
     sanitized_args = [sanitize_log_input(arg) for arg in args]
     logger.error(sanitized_message, *sanitized_args)
 
-def verify_scheduled_execution(context):
-    """スケジュール実行の検証（認可制御強化）"""
-    try:
-        # CloudWatch Eventsからの実行かチェック
-        if hasattr(context, 'invoked_function_arn'):
-            function_arn = context.invoked_function_arn
-            if not function_arn.startswith('arn:aws:lambda:'):
-                safe_log_error("無効なLambda関数ARN")
-                return False
+class ServerSideSessionManager:
+    """サーバーサイドセッション管理クラス"""
+    
+    def __init__(self):
+        self.dynamodb = boto3.resource('dynamodb')
+        self.session_table_name = os.getenv('SESSION_TABLE_NAME', 'lambda-sessions')
+        self.session_timeout = int(os.getenv('SESSION_TIMEOUT', '3600'))  # 1時間
         
-        # 実行ロールの検証
+    def get_session_table(self):
+        """セッションテーブルの取得/作成"""
         try:
-            import boto3
-            sts_client = boto3.client('sts')
-            caller_identity = sts_client.get_caller_identity()
+            table = self.dynamodb.Table(self.session_table_name)
+            # テーブルの存在確認
+            table.load()
+            return table
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                safe_log_info(f"セッションテーブル {self.session_table_name} が存在しません。IAM権限ベースの認証を使用します。")
+                return None
+            else:
+                safe_log_error(f"セッションテーブルアクセスエラー: {str(e)}")
+                return None
+    
+    def get_session_data(self, session_id):
+        """サーバーサイドセッションデータの取得"""
+        try:
+            if not session_id:
+                return None
+                
+            table = self.get_session_table()
+            if not table:
+                return None
             
-            # 期待される実行ロールかチェック
-            expected_role_pattern = 'role-SendTemperatureHumiditytoDiscord'
-            if expected_role_pattern not in caller_identity.get('Arn', ''):
-                safe_log_error(f"予期しない実行ロール: {caller_identity.get('Arn')}")
-                return False
+            response = table.get_item(
+                Key={'session_id': session_id}
+            )
             
-            safe_log_info("スケジュール実行検証成功")
-            return True
+            if 'Item' not in response:
+                safe_log_error(f"セッションが見つかりません: {session_id}")
+                return None
+            
+            session_data = response['Item']
+            
+            # セッションの有効期限チェック
+            current_time = int(time.time())
+            if session_data.get('expires_at', 0) < current_time:
+                safe_log_error(f"セッションが期限切れです: {session_id}")
+                self.delete_session(session_id)
+                return None
+            
+            safe_log_info(f"有効なセッションデータを取得: {session_id}")
+            return session_data
             
         except Exception as e:
-            safe_log_error(f"STS呼び出しエラー: {str(e)}")
-            return False
+            safe_log_error(f"セッションデータ取得エラー: {str(e)}")
+            return None
+    
+    def delete_session(self, session_id):
+        """期限切れセッションの削除"""
+        try:
+            table = self.get_session_table()
+            if table:
+                table.delete_item(Key={'session_id': session_id})
+        except Exception as e:
+            safe_log_error(f"セッション削除エラー: {str(e)}")
+
+def get_user_role_from_iam(context):
+    """IAMロールからユーザー権限を取得（サーバーサイド認証）"""
+    try:
+        sts_client = boto3.client('sts')
+        caller_identity = sts_client.get_caller_identity()
+        
+        # IAMロールから権限レベルを判定
+        arn = caller_identity.get('Arn', '')
+        
+        # ロール名から権限レベルを判定
+        if 'AdministratorAccess' in arn or 'Admin' in arn:
+            return 'ADMIN', AUTHORIZATION_LEVELS['ADMIN']
+        elif 'SendTemperatureHumiditytoDiscord' in arn:
+            return 'OPERATOR', AUTHORIZATION_LEVELS['OPERATOR']
+        elif 'ReadOnly' in arn:
+            return 'VIEWER', AUTHORIZATION_LEVELS['VIEWER']
+        else:
+            return 'GUEST', AUTHORIZATION_LEVELS['GUEST']
+            
+    except Exception as e:
+        safe_log_error(f"IAMロール取得エラー: {str(e)}")
+        return 'GUEST', AUTHORIZATION_LEVELS['GUEST']
+
+def get_user_role_from_session(event):
+    """サーバーサイドセッションからユーザー権限を取得"""
+    try:
+        session_manager = ServerSideSessionManager()
+        
+        # セッションIDの取得（複数の方法を試行）
+        session_id = None
+        
+        # 1. ヘッダーから取得
+        headers = event.get('headers', {})
+        session_id = headers.get('X-Session-ID') or headers.get('Authorization', '').replace('Bearer ', '')
+        
+        # 2. リクエストコンテキストから取得
+        if not session_id and 'requestContext' in event:
+            session_id = event['requestContext'].get('authorizer', {}).get('session_id')
+        
+        if not session_id:
+            safe_log_error("セッションIDが見つかりません")
+            return None, 0
+        
+        # サーバーサイドセッションデータの取得
+        session_data = session_manager.get_session_data(session_id)
+        if not session_data:
+            return None, 0
+        
+        # セッションからロール情報を取得
+        user_role = session_data.get('role', 'GUEST')
+        authorization_level = AUTHORIZATION_LEVELS.get(user_role, 0)
+        
+        safe_log_info(f"セッションから取得した権限: {user_role} (レベル: {authorization_level})")
+        return user_role, authorization_level
         
     except Exception as e:
-        safe_log_error(f"スケジュール実行検証エラー: {str(e)}")
-        return False
+        safe_log_error(f"セッション権限取得エラー: {str(e)}")
+        return None, 0
+
+def check_required_authorization_level(action):
+    """アクションに必要な認可レベルを取得"""
+    action_requirements = {
+        'send_notification': AUTHORIZATION_LEVELS['OPERATOR'],
+        'read_sensor_data': AUTHORIZATION_LEVELS['VIEWER'],
+        'scheduled_execution': AUTHORIZATION_LEVELS['OPERATOR']
+    }
+    
+    return action_requirements.get(action, AUTHORIZATION_LEVELS['ADMIN'])
+
+def perform_server_side_authorization(event, context, required_action):
+    """サーバーサイド認可チェック（改良版）"""
+    try:
+        safe_log_info(f"サーバーサイド認可チェック開始: {required_action}")
+        
+        # 必要な認可レベルを取得
+        required_level = check_required_authorization_level(required_action)
+        
+        # 1. サーバーサイドセッションからの権限取得を試行
+        session_role, session_level = get_user_role_from_session(event)
+        
+        if session_role and session_level >= required_level:
+            safe_log_info(f"セッション認証成功: {session_role} (レベル: {session_level})")
+            return True, session_role
+        
+        # 2. IAMロールベースの認証にフォールバック
+        iam_role, iam_level = get_user_role_from_iam(context)
+        
+        if iam_level >= required_level:
+            safe_log_info(f"IAM認証成功: {iam_role} (レベル: {iam_level})")
+            return True, iam_role
+        
+        safe_log_error(f"認可レベル不足: 必要={required_level}, セッション={session_level}, IAM={iam_level}")
+        return False, None
+        
+    except Exception as e:
+        safe_log_error(f"サーバーサイド認可チェックエラー: {str(e)}")
+        return False, None
 
 def perform_authorization_checks(event, context):
-    """包括的な認可チェック（Broken Access Control対策）"""
+    """包括的な認可チェック（サーバーサイドセッション対応版）"""
     try:
         safe_log_info("認可チェック開始")
         
-        # スケジュール実行の検証（温度・湿度通知は定期実行）
-        if not verify_scheduled_execution(context):
-            raise ValueError("スケジュール実行検証に失敗しました")
+        # サーバーサイド認可チェック（スケジュール実行用）
+        is_authorized, user_role = perform_server_side_authorization(event, context, 'scheduled_execution')
+        if not is_authorized:
+            raise ValueError("サーバーサイド認可チェックに失敗しました")
         
-        safe_log_info("全ての認可チェックが成功しました")
+        safe_log_info(f"全ての認可チェックが成功しました (ユーザー権限: {user_role})")
         return True
         
     except Exception as e:
