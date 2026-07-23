@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import os
 import time
+import uuid
 import requests
 
 
@@ -15,7 +16,7 @@ SECRET: str = os.getenv('SECRET')
 def __generate_request_headers() -> dict:
     """SWITCH BOT APIのリクエストヘッダーを生成する"""
 
-    nonce = ""
+    nonce = str(uuid.uuid4())
     t = str(round(time.time() * 1000))
     string_to_sign = "{}{}{}".format(ACCESS_TOKEN, t, nonce)
     string_to_sign_b = bytes(string_to_sign, "utf-8")
@@ -28,14 +29,16 @@ def __generate_request_headers() -> dict:
         "Content-Type": "application/json",
         "Authorization": ACCESS_TOKEN,
         "t": t,
-        "sign": sign,
+        "sign": sign.decode("utf-8"),
         "nonce": nonce,
     }
 
 
 def post_webhook(path: str, body: dict) -> str:
     url = f"{API_BASE_URL}/webhook/{path}"
-    response = requests.post(url, headers=__generate_request_headers(), json=body)
+    response = requests.post(
+        url, headers=__generate_request_headers(), json=body, timeout=30
+    )
 
     return response.json()
 
